@@ -1,0 +1,128 @@
+name: Zizmor Security Scan
+
+on:
+  pull_request_target:
+    branches: [ main ]
+  workflow_call:
+  merge_group:
+
+permissions:
+  contents: read
+  id-token: write      # Required for Workload Identity Federation (WIF)
+  security-events: write # Required for uploading SARIF results to GitHub Code Scanning
+
+jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run_scan: ${{ steps.filter.outputs.workflows }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for modified workflows
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            workflows:
+              - '.github/workflows/**'
+
+  zizmor-config:
+    needs: check-changes
+    if: ${{ needs.check-changes.outputs.run_scan == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/my-provider'
+          service_account: 'zizmor-config-reader@://gserviceaccount.com'
+
+      - name: Download Config from GCS
+        uses: google-github-actions/download-cloud-storage-object@v2
+        with:
+          bucket: 'my-zizmor-config-bucket'
+          object: 'zizmor.toml'
+          destination: './zizmor.toml'
+
+      - name: Upload Config Artifact for Downstream Jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: zizmor-config-file
+          path: ./zizmor.toml
+          retention-days: 1
+
+  zizmor-scan:
+    needs: check-changes
+    if: ${{ needs.check-changes.outputs.run_scan == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Zizmor (Docker)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" \
+            woodruffw/zizmor:latest /src --format sarif > zizmor-results.sarif
+        continue-on-error: true
+
+      - name: Enrich SARIF Metadata
+        run: |
+          # Add custom workflow metadata or environment enrichments to SARIF here
+          echo "Enriching SARIF execution properties..."
+          jq '.runs[0].properties.actionsWorkflow = "${{ github.workflow }}"' zizmor-results.sarif > enriched-results.sarif
+
+      - name: Upload Enriched SARIF Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zizmor-sarif-results
+          path: enriched-results.sarif
+          retention-days: 1
+
+  zizmor-upload:
+    needs: [zizmor-config, zizmor-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download SARIF Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zizmor-sarif-results
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/my-provider'
+          service_account: 'zizmor-uploader@://gserviceaccount.com'
+
+      - name: Upload SARIF to GCS
+        uses: google-github-actions/upload-cloud-storage@v2
+        with:
+          path: 'enriched-results.sarif'
+          destination: 'my-zizmor-audit-logs-bucket/'
+
+  zizmor-output:
+    needs: [zizmor-config, zizmor-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download SARIF Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zizmor-sarif-results
+
+      - name: Upload Results to GitHub Code Scanning
+        uses: github/code-scanning-upload-aurora-action@v3
+        with:
+          sarif_file: enriched-results.sarif
+
+      - name: Evaluate Gates & Fail on Findings
+        run: |
+          # Parse SARIF file to evaluate finding severities
+          ERROR_COUNT=$(jq '[.runs[0].results[] | select(.level == "error")] | length' enriched-results.sarif)
+          echo "Found $ERROR_COUNT error-level vulnerabilities."
+          if [ "$ERROR_COUNT" -gt 0 ]; then
+            echo "Zizmor scan failed due to policy violations."
+            exit 1
+          fi
